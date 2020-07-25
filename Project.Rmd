@@ -1,0 +1,1019 @@
+---
+title: "Kaggle Project"
+author: "Julian Gomez"
+date: "11/5/2019"
+output: pdf_document
+---
+
+```{r load, eval=FALSE}
+library(tidyverse)
+library(lubridate)
+library(leaps)
+library(randomForest)
+library(glmnet)
+library(Hmisc)
+library(pls)
+library(caret)
+library(naniar)
+library(data.table)
+
+buildings <- read.csv('~/Documents/STAT 488/ashrae-energy-prediction/building_metadata.csv')
+b_train <- read.csv('~/Documents/STAT 488/ashrae-energy-prediction/train.csv')
+
+b_train$ln_meter <- log(b_train$meter_reading + 1)
+
+w_train <- read.csv('~/Documents/STAT 488/ashrae-energy-prediction/weather_train.csv')
+
+
+b_test <- read.csv('~/Documents/STAT 488/ashrae-energy-prediction/test.csv')
+w_test <- read.csv('~/Documents/STAT 488/ashrae-energy-prediction/weather_test.csv')
+```
+
+```{r train join, eval=FALSE}
+## combine training data with weather data
+b_train2 <- b_train %>% left_join(buildings, by = 'building_id') 
+rm(b_train)
+b_train3 <- b_train2 %>% left_join(w_train, by = c('site_id', 'timestamp'))
+rm(b_train2)
+## Create date
+b_train3$date <- as.Date(b_train3$timestamp)
+b_train3$month <- format(as.Date(b_train3$timestamp), '%Y-%m')
+b_train3 <- b_train3 %>% mutate(meter2 = case_when(
+    meter == 0 ~ 'electricity',
+    meter == 1 ~ 'chilled water',
+    meter == 2 ~ 'steam',
+    meter == 3~'hot water'
+  )) 
+```
+
+```{r test join, eval=FALSE}
+b_test2 <- b_test %>% left_join(buildings, by = 'building_id') 
+rm(b_test)
+b_test3 <- b_test2 %>% left_join(w_test, by = c('site_id', 'timestamp'))
+rm(b_test2)
+
+```
+
+
+```{r frames, eval=FALSE}
+## create weather summary by day
+weather_sum <- b_train3 %>% group_by(site_id,date) %>% 
+  summarise(avg_air_temperature = mean(air_temperature, na.rm = TRUE),
+            avg_dew_temperature = mean(dew_temperature, na.rm = TRUE),
+            avg_sea_level_presssure = mean(sea_level_pressure, na.rm = TRUE),
+            avg_cloud_coverage = mean(cloud_coverage, na.rm = TRUE),
+            avg_precipitation_depth = mean(precip_depth_1_hr, na.rm = TRUE),
+            avg_wind_speed = mean(wind_speed, na.rm = TRUE),
+            avg_ln_meter_reading = mean(ln_meter))
+```
+
+```{r eda, eval=FALSE}
+## building data
+buildings %>% ggplot() +
+  geom_bar(aes(x = primary_use)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+buildings %>% ggplot() +
+  geom_bar(aes(x = floor_count), na.rm = TRUE) + xlab('Floor Count')
+
+buildings %>% ggplot() +
+  geom_histogram(aes(x = square_feet)) +
+  xlab('Square Feet')
+
+## how many buildings on sites
+lo <- b_train3 %>%
+  distinct(site_id, building_id) %>%
+  group_by(site_id) %>%
+  summarise(number_of_buildings = n()) 
+
+lo %>% ggplot() +
+  geom_bar(aes(x = factor(site_id), y = number_of_buildings), stat = 'identity') +
+  xlab('Site ID') + ylab('Number of Buildings')
+
+## training weather data
+
+weather_sum %>% ggplot(aes(x = date, y = avg_ln_meter_reading)) +
+  geom_line(aes(col = factor(site_id))) + 
+  facet_wrap(~factor(site_id)) +
+  labs(col = "Site ID") + xlab('Date') +
+  ylab('Average Log Meter Reading') +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+weather_sum %>% ggplot(aes(x = date, y = avg_air_temperature)) +
+  geom_line(aes(col = factor(site_id))) +
+  labs(col = "Site ID") + xlab('Date') +
+  ylab('Average Daily Air Temperature')
+
+weather_sum %>% ggplot(aes(x = date, y = avg_dew_temperature)) +
+  geom_line(aes(col = factor(site_id))) + labs(col = "Site ID") +
+  xlab('Date') + ylab('Average Daily Dew Temperature')
+
+weather_sum %>% ggplot(aes(x = date, y = avg_sea_level_presssure)) + 
+  geom_line(aes(col = factor(site_id))) +
+  labs(col = "Site ID") +
+  xlab('Date') +
+  ylab('Average Daily Sea Level Pressure')
+
+weather_sum %>% ggplot(aes(x = date, y = avg_cloud_coverage)) +
+  geom_line(aes(col = factor(site_id))) +
+  labs(col = "Site ID") +
+  xlab('Date') + ylab('Average Daily Cloud Coverage')
+
+weather_sum %>% ggplot(aes(x = date, y = avg_precipitation_depth)) +
+  geom_line(aes(col = factor(site_id))) +
+  labs(col = "Site ID") + xlab('Date') +
+  ylab('Average Daily Precipitation (mm)')
+
+weather_sum %>% ggplot(aes(x = date, y = avg_wind_speed)) +
+  geom_line(aes(col = factor(site_id))) +
+  labs(col = "Site ID") + xlab('Date') + ylab('Average Daily Wind Speed')
+
+
+
+
+## boxplots: meter readings
+b_train3 %>% ggplot() +
+  geom_boxplot(aes(x = factor(site_id), y = ln_meter), fill = 'steel blue') +
+  coord_flip() + xlab('Site ID') + ylab('Log Meter Reading')
+
+
+## temperature by site
+weather_sum %>% ggplot() +
+  geom_boxplot(aes(x = factor(site_id), y = avg_air_temperature), fill = 'steel blue') +
+  coord_flip() + xlab('Site ID') + ylab('Average Daily Air Temperature')
+
+## temperature by site
+b_train3 %>% ggplot() +
+  geom_boxplot(aes(x = factor(site_id), y = air_temperature), fill = 'steel blue') +
+  coord_flip() + xlab('Site ID') + ylab('Air Temperature') 
+
+## missing data 
+gg_miss_var(b_train3)
+
+gg_miss_fct(x = b_train3, fct = site_id) + xlab('Site ID')
+```
+
+
+
+
+```{r NA, eval=FALSE}
+## impute missing values by site
+
+## function that will calculate daily averages for missing values
+daily_avg <- function(x) ifelse(is.na(x), mean(x, na.rm = TRUE), x)
+
+## function that will calculate monthly averages for missing values
+monthly_avg <- function(x) ifelse(is.na(x), mean(x, na.rm = TRUE), x)
+
+
+## site 0
+site0_tr <- b_train3 %>% filter(site_id == 0) 
+
+## site 1
+site1_tr <- b_train3 %>% filter(site_id == 1) 
+
+## site 2
+site2_tr <- b_train3 %>% filter(site_id == 2) 
+
+## site 3
+site3_tr <- b_train3 %>% filter(site_id == 3) 
+
+## site 4
+site4_tr <- b_train3 %>% filter(site_id == 4) 
+
+## site 5
+site5_tr <- b_train3 %>% filter(site_id == 5) 
+
+## site 6
+site6_tr <- b_train3 %>% filter(site_id == 6) 
+
+## site 7
+site7_tr <- b_train3 %>% filter(site_id == 7) 
+
+## site 8
+site8_tr <- b_train3 %>% filter(site_id == 8) 
+
+## site 9
+site9_tr <- b_train3 %>% filter(site_id == 9) 
+
+## site 10
+site10_tr <- b_train3 %>% filter(site_id == 10) 
+
+## site 11
+site11_tr <- b_train3 %>% filter(site_id == 11) 
+
+## site 12
+site12_tr <- b_train3 %>% filter(site_id == 12) 
+
+## site 13
+site13_tr <- b_train3 %>% filter(site_id == 13) 
+
+## site 14
+site14_tr <- b_train3 %>% filter(site_id == 14) 
+
+## site 15
+site15_tr <- b_train3 %>% filter(site_id == 15) 
+
+site_impute <- function(df, title){
+  
+  print(gg_miss_var(df, show_pct = TRUE) + ggtitle(title))
+  
+  df$air_temperature <- ave(df$air_temperature, df$date, FUN = daily_avg)
+  
+  df$air_temperature <- ave(df$air_temperature, df$month, FUN = monthly_avg)
+
+  df$dew_temperature <- ave(df$dew_temperature, df$date, FUN = daily_avg)
+  
+  df$dew_temperature <- ave(df$dew_temperature, df$month, FUN = monthly_avg)
+  
+  df$precip_depth_1_hr <- ave(df$precip_depth_1_hr, df$date, FUN = daily_avg)
+  
+  df$precip_depth_1_hr <- ave(df$precip_depth_1_hr, df$month, FUN = monthly_avg)
+  
+  df$wind_speed <- ave(df$wind_speed, df$date, FUN = daily_avg)
+  
+  df$wind_speed <- ave(df$wind_speed, df$month, FUN = monthly_avg)
+  
+  df$sea_level_pressure <- ave(df$sea_level_pressure, df$date, FUN = daily_avg)
+  
+  df$sea_level_pressure <- ave(df$sea_level_pressure, df$month, FUN = monthly_avg)
+  
+  df$wind_direction <- ave(df$wind_direction, df$date, FUN = daily_avg)
+  
+  df$wind_direction <- ave(df$wind_direction, df$month, FUN = monthly_avg)
+  
+  df$cloud_coverage <- ave(df$cloud_coverage, df$date, FUN = daily_avg)
+  
+  df$cloud_coverage <- ave(df$cloud_coverage, df$month, FUN = monthly_avg)
+  
+  df
+}
+
+## impute the averages according the the function
+
+site0_tr <- site_impute(site0_tr, 'Site 0 Missing Data')
+
+site1_tr <- site_impute(site1_tr, 'Site 1 Missing Data')
+
+site2_tr <- site_impute(site2_tr, 'Site 2 Missing Data')
+
+site3_tr <- site_impute(site3_tr, 'Site 3 Missing Data')
+
+site4_tr <- site_impute(site4_tr, 'Site 4 Missing Data')
+
+site5_tr <- site_impute(site5_tr, 'Site 5 Missing Data')
+
+
+site6_tr <- site_impute(site6_tr, 'Site 6 Missing Data')
+
+
+site8_tr <- site_impute(site8_tr, 'Site 8 Missing Data')
+
+
+site9_tr <- site_impute(site9_tr, 'Site 9 Missing Data')
+
+
+site10_tr <- site_impute(site10_tr, 'Site 10 Missing Data')
+
+
+site12_tr <- site_impute(site12_tr, 'Site 12 Missing Data')
+
+site13_tr <- site_impute(site13_tr, 'Site 13 Missing Data')
+
+site14_tr <- site_impute(site14_tr, 'Site 14 Missing Data')
+
+site15_tr <- site_impute(site15_tr, 'Site 15 Missing Data')
+
+
+## Additional imputations: cloud coverage completely missing
+
+
+## for site 7
+gg_miss_var(site7_tr, show_pct = TRUE) + ggtitle('Site 7 Missing Data')
+
+site7_tr$air_temperature <- ave(site7_tr$air_temperature, site7_tr$date, FUN = daily_avg)
+
+site7_tr$dew_temperature <- ave(site7_tr$dew_temperature, site7_tr$date, FUN = daily_avg)
+
+site7_tr$precip_depth_1_hr <- ave(site7_tr$precip_depth_1_hr, site7_tr$date, FUN = daily_avg)
+
+site7_tr$precip_depth_1_hr <- ave(site7_tr$precip_depth_1_hr, site7_tr$month, FUN = monthly_avg)
+  
+site7_tr$wind_speed <- ave(site7_tr$wind_speed, site7_tr$date, FUN = daily_avg)
+
+site7_tr$sea_level_pressure <- ave(site7_tr$sea_level_pressure, site7_tr$date, FUN = daily_avg)
+
+site7_tr$wind_direction <- ave(site7_tr$wind_direction, site7_tr$date, FUN = daily_avg)
+
+site7_tr$cloud_coverage <- ave(site7_tr$cloud_coverage, site7_tr$date, FUN = daily_avg)
+  
+
+  
+
+
+## for site 11
+gg_miss_var(site11_tr, show_pct = TRUE) + ggtitle('Site 11 Missing Data')
+
+site11_tr$air_temperature <- ave(site11_tr$air_temperature, site11_tr$date, FUN = daily_avg)
+
+site11_tr$dew_temperature <- ave(site11_tr$dew_temperature, site11_tr$date, FUN = daily_avg)
+  
+site11_tr$precip_depth_1_hr <- ave(site11_tr$precip_depth_1_hr, site11_tr$date, FUN = daily_avg)
+
+site11_tr$precip_depth_1_hr <- ave(site11_tr$precip_depth_1_hr, site11_tr$month, FUN = monthly_avg)
+
+site11_tr$wind_speed <- ave(site11_tr$wind_speed, site11_tr$date, FUN = daily_avg)
+  
+site11_tr$wind_direction <- ave(site11_tr$wind_direction, site11_tr$date, FUN = daily_avg)
+
+site11_tr$cloud_coverage <- ave(site11_tr$cloud_coverage, site11_tr$date, FUN = daily_avg)
+  
+site11_tr$sea_level_pressure <- ave(site11_tr$sea_level_pressure, site11_tr$date, FUN = daily_avg)
+
+
+```
+
+```{r imputed, eval=FALSE}
+## combine imputed training data 
+imputed_train <- rbind(site0_tr, site1_tr, site2_tr, site3_tr,
+                       site4_tr, site5_tr, site6_tr, site7_tr,
+                       site8_tr, site9_tr, site10_tr, site11_tr,
+                       site12_tr, site13_tr, site14_tr, site15_tr)
+
+gg_miss_fct(x = imputed_train, fct = site_id) + xlab('Site ID')
+rm(imputed_train)
+```
+
+```{r site training, eval=FALSE}
+
+site_train <- function(df, name, terms){ 
+  ## input data frame, name of site for reference, and quantitative variables to include in the model
+  set.seed(1)
+  site_vars <- df[,terms] ## get data frame with the quantitative variables
+
+  train = sample(1:nrow(site_vars), nrow(site_vars)*0.75)
+  test = (-train)
+  
+  ln_meter_test = site_vars$ln_meter[test]
+
+
+  ## Model matrix
+  X = model.matrix(ln_meter ~., site_vars)[,-1]
+  Y = site_vars$ln_meter
+  
+  ## Ridge regression
+    
+  
+  cv_out <- cv.glmnet(X[train,], Y[train], alpha = 0)
+  
+  lamr <- cv_out$lambda.min
+  
+  ridge_fit <- glmnet(X[train,], Y[train], alpha = 0, lambda = lamr)
+  
+  pred_ridge <- predict(ridge_fit, s = lamr, newx = X[test,]) ## predictions in log scale
+  lmse_r <- mean((pred_ridge - ln_meter_test)^2)    
+  
+  ## Lasso Regression
+  cv_out <- cv.glmnet(X[train,], Y[train], alpha = 1)
+  
+  laml <- cv_out$lambda.min
+  
+  lasso_fit <- glmnet(X[train,], Y[train], alpha = 1, lambda = laml)
+  
+  pred_lasso <- predict(lasso_fit, s = laml, newx = X[test,])
+  lmse_l <- mean((pred_lasso - ln_meter_test)^2)   
+  
+  
+  ## elastic net
+  cv_10 = trainControl(method = "cv", number = 10)
+  
+  cv_en <- train(ln_meter ~ ., data = site_vars[train,], method = 'glmnet', trControl = cv_10)
+  
+  tune_en <- cv_en$bestTune
+  
+  fit_en <- glmnet(X[train,], Y[train], alpha = tune_en[[1]], lambda = tune_en[[2]])
+  
+  en_pred <- predict(fit_en, s = tune_en[[2]], X[test,])
+  
+  lmse_en <- mean((en_pred -  ln_meter_test)^2)
+  
+  print(name)  
+  lmse_df = data.frame(ridge = lmse_r, lasso = lmse_l, elastic_net = lmse_en)
+
+  if((lmse_df$elastic_net < lmse_df$ridge) & (lmse_df$elastic_net < lmse_df$lasso)){
+    print('use an elastic net regression model')
+    print(tune_en)
+  }else if((lmse_df$lasso < lmse_df$elastic_net) & (lmse_df$lasso < lmse_df$ridge)){
+    print('use a lasso regression model')
+    print(laml)
+  }else{
+    print('use a ridge regression model')
+    print(lamr)
+  }
+  
+  return(lmse_df)
+  print(' ')
+
+}
+
+
+##### site 0 #####
+site_train(site0_tr, 'site 0', c('ln_meter', 'square_feet', 'air_temperature',
+                                 'cloud_coverage','dew_temperature', 'precip_depth_1_hr',
+                                 'sea_level_pressure','wind_direction', 'wind_speed'))
+
+
+##### site 1 #####
+
+site_train(site1_tr, 'site 1', c('ln_meter', 'square_feet', 'air_temperature',
+                                 'floor_count', 'cloud_coverage', 'dew_temperature',
+                                 'sea_level_pressure', 'wind_direction', 'wind_speed'))
+
+##### site 2 #####
+site_train(site2_tr, 'site 2', c('ln_meter', 'square_feet', 'air_temperature',
+                                 'cloud_coverage', 'dew_temperature', 'precip_depth_1_hr',
+                                 'sea_level_pressure','wind_direction', 'wind_speed'))
+
+##### site 3 #####
+site_train(site3_tr, 'site 3', c('ln_meter', 'square_feet', 'air_temperature',
+                                 'cloud_coverage', 'dew_temperature', 'precip_depth_1_hr',
+                                 'sea_level_pressure','wind_direction', 'wind_speed'))
+
+##### site 4 #####
+
+site_train(site4_tr, 'site 4', c('ln_meter', 'square_feet', 'floor_count',
+                                 'air_temperature', 'cloud_coverage', 'dew_temperature',
+                                 'precip_depth_1_hr', 'sea_level_pressure',
+                                 'wind_direction', 'wind_speed'))
+
+##### site 5 #####
+
+site_train(site5_tr, 'site 5', c('ln_meter', 'square_feet', 'air_temperature',
+                                 'floor_count', 'cloud_coverage', 'dew_temperature',
+                                 'wind_direction', 'wind_speed'))
+
+##### site 6 #####
+site_train(site6_tr, 'site 6', c('ln_meter', 'square_feet', 'air_temperature',
+                                 'cloud_coverage', 'dew_temperature', 'precip_depth_1_hr',
+                                 'sea_level_pressure','wind_direction', 'wind_speed'))
+
+##### site 7 #####
+
+site_train(site7_tr, 'site 7', c('ln_meter', 'square_feet', 'floor_count',
+                                 'air_temperature', 'dew_temperature','precip_depth_1_hr',
+                                 'sea_level_pressure', 'wind_direction', 'wind_speed'))
+
+##### site 8 #####
+
+site_train(site8_tr, 'site 8', c('ln_meter', 'square_feet', 'floor_count',
+                                 'air_temperature', 'cloud_coverage', 'dew_temperature',
+                                 'precip_depth_1_hr', 'sea_level_pressure',
+                                 'wind_direction', 'wind_speed'))
+
+##### site 9 #####
+site_train(site9_tr, 'site 9', c('ln_meter', 'square_feet', 'air_temperature',
+                                 'cloud_coverage', 'dew_temperature', 'precip_depth_1_hr',
+                                 'sea_level_pressure','wind_direction', 'wind_speed'))
+
+##### site 10 #####
+
+site_train(site10_tr, 'site 10', c('ln_meter', 'square_feet', 'floor_count',
+                                   'air_temperature', 'cloud_coverage', 'dew_temperature',
+                                   'precip_depth_1_hr', 'sea_level_pressure',
+                                   'wind_direction', 'wind_speed'))
+
+##### site 11 #####
+site_train(site11_tr, 'site 11', c('ln_meter', 'square_feet', 
+                                   'air_temperature', 'dew_temperature',
+                                   'precip_depth_1_hr', 'sea_level_pressure',
+                                   'wind_direction', 'wind_speed'))
+
+
+#### site 12####
+site_train(site12_tr, 'site 12', c('ln_meter', 'square_feet', 'air_temperature',
+                                   'cloud_coverage', 'dew_temperature',
+                                   'sea_level_pressure', 'wind_direction', 'wind_speed'))
+
+
+##### site 13 #####
+site_train(site13_tr, 'site 13', c('ln_meter', 'square_feet',
+                                   'air_temperature', 'cloud_coverage', 
+                                   'dew_temperature', 'precip_depth_1_hr',
+                                   'sea_level_pressure','wind_direction', 'wind_speed'))
+
+##### site 14 #####
+site_train(site14_tr, 'site 14', c('ln_meter', 'square_feet', 'air_temperature',
+                                   'cloud_coverage', 'dew_temperature', 'precip_depth_1_hr',
+                                   'sea_level_pressure','wind_direction', 'wind_speed'))
+
+##### site 15 #####
+site_train(site15_tr, 'site 15', c('ln_meter', 'square_feet', 'air_temperature', 
+                                   'cloud_coverage', 'dew_temperature', 'precip_depth_1_hr',
+                                   'sea_level_pressure','wind_direction', 'wind_speed'))
+
+
+```
+
+
+
+```{r test sets, eval=FALSE}
+
+
+site_impute2 <- function(df){
+  
+  df$date <- as.Date(df$timestamp) ## add date since the test set is twice as large
+  
+  df$month <- format(as.Date(df$timestamp), '%Y-%m') ## extract specific month
+  
+  df$air_temperature <- ave(df$air_temperature, df$date, FUN = daily_avg)
+  
+  df$air_temperature <- ave(df$air_temperature, df$month, FUN = monthly_avg)
+
+  df$dew_temperature <- ave(df$dew_temperature, df$date, FUN = daily_avg)
+  
+  df$dew_temperature <- ave(df$dew_temperature, df$month, FUN = monthly_avg)
+  
+  df$precip_depth_1_hr <- ave(df$precip_depth_1_hr, df$date, FUN = daily_avg)
+  
+  df$precip_depth_1_hr <- ave(df$precip_depth_1_hr, df$month, FUN = monthly_avg)
+  
+  df$wind_speed <- ave(df$wind_speed, df$date, FUN = daily_avg)
+  
+  df$wind_speed <- ave(df$wind_speed, df$month, FUN = monthly_avg)
+  
+  df$sea_level_pressure <- ave(df$sea_level_pressure, df$date, FUN = daily_avg)
+  
+  df$sea_level_pressure <- ave(df$sea_level_pressure, df$month, FUN = monthly_avg)
+  
+  df$wind_direction <- ave(df$wind_direction, df$date, FUN = daily_avg)
+  
+  df$wind_direction <- ave(df$wind_direction, df$month, FUN = monthly_avg)
+  
+  df$cloud_coverage <- ave(df$cloud_coverage, df$date, FUN = daily_avg)
+  
+  df$cloud_coverage <- ave(df$cloud_coverage, df$month, FUN = monthly_avg)
+  
+  df
+}
+
+test_data <- b_test3
+
+
+site0_t <- subset(test_data, site_id == 0)
+site0_t <- site_impute2(site0_t)
+
+site1_t <- subset(test_data, site_id == 1)
+site1_t <- site_impute2(site1_t) ## additional imputations
+
+site2_t <- subset(test_data, site_id == 2)
+site2_t <- site_impute2(site2_t)
+
+site3_t <- subset(test_data, site_id == 3)
+site3_t <- site_impute2(site3_t)
+
+site4_t <- subset(test_data, site_id == 4)
+site4_t <- site_impute2(site4_t)
+
+site5_t <- subset(test_data, site_id == 5)
+site5_t <- site_impute2(site5_t)
+
+site6_t <- subset(test_data, site_id == 6)
+site6_t <- site_impute2(site6_t)
+
+site7_t <- subset(test_data, site_id == 7)
+
+
+site8_t <- subset(test_data, site_id == 8)
+site8_t <- site_impute2(site8_t)
+
+site9_t <- subset(test_data, site_id == 9)
+site9_t <- site_impute2(site9_t)
+
+site10_t <- subset(test_data, site_id == 10)
+site10_t <- site_impute2(site10_t)
+
+site11_t <- subset(test_data, site_id == 11)
+
+
+site12_t <- subset(test_data, site_id == 12)
+site12_t <- site_impute2(site12_t)
+
+site13_t <- subset(test_data, site_id == 13)
+site13_t <- site_impute2(site13_t)
+
+site14_t <- subset(test_data, site_id == 14)
+site14_t <- site_impute2(site14_t)
+
+site15_t <- subset(test_data, site_id == 15)
+site15_t <- site_impute2(site15_t)
+
+rm(b_test3)
+rm(test_data)
+rm(b_train3)
+```
+
+```{r additional test imputations, eval=FALSE}
+### the site impute function did not work for sites 7 and 11, so I imputed the daily and monthly averages individually, since the cloud coverage is empty
+
+#### site 7 ####
+site7_t$date <- as.Date(site7_t$timestamp) ## add date since the test set is twice as large
+
+site7_t$month <- format(as.Date(site7_t$timestamp), '%Y-%m')
+
+site7_t$air_temperature <- ave(site7_t$air_temperature, site7_t$date, FUN = daily_avg)
+
+site7_t$air_temperature <- ave(site7_t$air_temperature, site7_t$month, FUN = monthly_avg)
+
+site7_t$dew_temperature <- ave(site7_t$dew_temperature, site7_t$date, FUN = daily_avg)
+
+site7_t$dew_temperature <- ave(site7_t$dew_temperature, site7_t$month, FUN = monthly_avg)
+
+site7_t$precip_depth_1_hr <- ave(site7_t$precip_depth_1_hr, site7_t$date, FUN = daily_avg)
+
+site7_t$precip_depth_1_hr <- ave(site7_t$precip_depth_1_hr, site7_t$month, FUN = monthly_avg)
+
+site7_t$wind_speed <- ave(site7_t$wind_speed, site7_t$date, FUN = daily_avg)
+
+site7_t$wind_speed <- ave(site7_t$wind_speed, site7_t$month, FUN = monthly_avg)
+
+site7_t$wind_direction <- ave(site7_t$wind_direction, site7_t$date, FUN = daily_avg)
+  
+site7_t$wind_direction <- ave(site7_t$wind_direction, site7_t$month, FUN = monthly_avg)
+
+site7_t$sea_level_pressure <- ave(site7_t$sea_level_pressure, site7_t$date, FUN = daily_avg)
+
+site7_t$sea_level_pressure <- ave(site7_t$sea_level_pressure, site7_t$month, FUN = monthly_avg)
+
+
+
+#### site 11 ####
+site11_t$date <- as.Date(site11_t$timestamp) ## add date since the test set is twice as large
+
+site11_t$month <- format(as.Date(site11_t$timestamp), '%Y-%m')
+
+site11_t$air_temperature <- ave(site11_t$air_temperature, site11_t$date, FUN = daily_avg)
+
+site11_t$air_temperature <- ave(site11_t$air_temperature, site11_t$month, FUN = monthly_avg)
+
+site11_t$dew_temperature <- ave(site11_t$dew_temperature, site11_t$date, FUN = daily_avg)
+
+site11_t$dew_temperature <- ave(site11_t$dew_temperature, site11_t$month, FUN = monthly_avg)
+
+site11_t$precip_depth_1_hr <- ave(site11_t$precip_depth_1_hr, site11_t$date, FUN = daily_avg)
+
+site11_t$precip_depth_1_hr <- ave(site11_t$precip_depth_1_hr, site11_t$month, FUN = monthly_avg)
+
+site11_t$wind_speed <- ave(site11_t$wind_speed, site11_t$date, FUN = daily_avg)
+
+site11_t$wind_speed <- ave(site11_t$wind_speed, site11_t$month, FUN = monthly_avg)
+
+site11_t$wind_direction <- ave(site11_t$wind_direction, site11_t$date, FUN = daily_avg)
+  
+site11_t$wind_direction <- ave(site11_t$wind_direction, site11_t$month, FUN = monthly_avg)
+
+site11_t$sea_level_pressure <- ave(site11_t$sea_level_pressure, site11_t$date, FUN = daily_avg)
+
+site11_t$sea_level_pressure <- ave(site11_t$sea_level_pressure, site11_t$month, FUN = monthly_avg)
+
+```
+
+
+```{r elastic net predictions, eval=FALSE}
+options(scipen=999)
+
+## predict with elastic net
+site_predict_en <- function(df_tr, df_t, terms_tr, terms_t){
+  set.seed(1)
+  site_df <- df_tr[, terms_tr] ## training data
+
+  site_df2 <- df_t[, terms_t] ## test data
+  
+  X_tr = model.matrix(ln_meter ~., site_df)[,-1]
+  Y_tr = site_df$ln_meter
+  
+  X_t <- as.matrix(site_df2) ## data for test and predict
+  
+  ## elastic net
+  cv_10 <- trainControl(method = "cv", number = 10)
+  
+  cv_en <- train(ln_meter ~ ., data = site_df, method = 'glmnet', trControl = cv_10)
+  
+  tune_en <- cv_en$bestTune
+  
+  print(tune_en) ## print alpha and lambdas
+  
+  fit_en <- glmnet(X_tr, Y_tr, alpha = tune_en[[1]], lambda = tune_en[[2]]) ## extract alpha and lambda parameters
+  
+  print(coef(fit_en)) ## print model coefficients
+  
+  preds <- predict(fit_en, X_t)
+  
+  df_t$ln_meter <- as.data.frame(preds)
+
+  df_t
+}
+
+##### site 0 #####
+site0_p <- site_predict_en(site0_tr, site0_t, c('ln_meter', 'square_feet', 'air_temperature',
+                                                'cloud_coverage', 'dew_temperature',
+                                                'precip_depth_1_hr', 'sea_level_pressure',
+                                                'wind_direction', 'wind_speed'),
+                           c('square_feet', 'air_temperature', 
+                             'cloud_coverage', 'dew_temperature',
+                             'precip_depth_1_hr', 'sea_level_pressure',
+                             'wind_direction', 'wind_speed'))
+
+rm(site0_tr)
+rm(site0_t)
+
+##### site 1 #####
+site1_p <- site_predict_en(site1_tr, site1_t,c('ln_meter', 'square_feet',
+                                               'air_temperature', 'floor_count', 
+                                               'cloud_coverage', 'dew_temperature',
+                                               'sea_level_pressure', 'wind_direction', 'wind_speed'),
+                           c('square_feet', 'air_temperature', 'floor_count',
+                             'cloud_coverage','dew_temperature',
+                             'sea_level_pressure', 'wind_direction', 'wind_speed'))
+
+rm(site1_tr)
+rm(site1_t)
+
+##### site 2 #####
+site2_p <- site_predict_en(site2_tr, site2_t,c('ln_meter', 'square_feet',
+                                               'air_temperature', 'cloud_coverage',
+                                               'dew_temperature', 'precip_depth_1_hr',
+                                               'sea_level_pressure','wind_direction', 'wind_speed'),
+                           c('square_feet', 'air_temperature', 'cloud_coverage',
+                             'dew_temperature', 'precip_depth_1_hr',
+                             'sea_level_pressure','wind_direction', 'wind_speed'))
+
+rm(site2_tr)
+rm(site2_t)
+
+##### site 3 #####
+site3_p <- site_predict_en(site3_tr, site3_t, c('ln_meter', 'square_feet',
+                                                'air_temperature', 'cloud_coverage',
+                                                'dew_temperature', 'precip_depth_1_hr',
+                                                'sea_level_pressure','wind_direction', 'wind_speed'),
+                           c('square_feet', 'air_temperature', 'cloud_coverage',
+                             'dew_temperature', 'precip_depth_1_hr',
+                             'sea_level_pressure','wind_direction', 'wind_speed'))
+
+rm(site3_tr)
+rm(site3_t)
+
+##### site 4 #####
+
+site4_p <- site_predict_en(site4_tr, site4_t, c('ln_meter', 'square_feet', 'floor_count',
+                                                'air_temperature', 'cloud_coverage', 'dew_temperature',
+                                                'precip_depth_1_hr', 'sea_level_pressure',
+                                                'wind_direction', 'wind_speed'),
+                           c('square_feet', 'floor_count', 'air_temperature',
+                             'cloud_coverage', 'dew_temperature', 
+                             'precip_depth_1_hr', 'sea_level_pressure',
+                             'wind_direction', 'wind_speed'))
+
+rm(site4_tr)
+rm(site4_t)
+
+##### site 6 #####
+
+site6_p <- site_predict_en(site6_tr, site6_t, c('ln_meter', 'square_feet', 'air_temperature',
+                                                'cloud_coverage', 'dew_temperature',
+                                                'precip_depth_1_hr', 'sea_level_pressure',
+                                                'wind_direction', 'wind_speed'),
+                           c('square_feet', 'air_temperature', 'cloud_coverage',
+                             'dew_temperature', 'precip_depth_1_hr', 
+                             'sea_level_pressure','wind_direction', 'wind_speed'))
+
+rm(site6_tr)
+rm(site6_t)
+
+
+#### site 8 ####
+
+site8_p <- site_predict_en(site8_tr, site8_t, c('ln_meter', 'square_feet',
+                                                'floor_count', 'air_temperature',
+                                                'cloud_coverage', 'dew_temperature',
+                                                'precip_depth_1_hr', 'sea_level_pressure',
+                                                'wind_direction', 'wind_speed'),
+                           c('square_feet', 'floor_count',
+                             'air_temperature', 'cloud_coverage',
+                             'dew_temperature', 'precip_depth_1_hr',
+                             'sea_level_pressure', 'wind_direction', 'wind_speed'))
+
+rm(site8_tr)
+rm(site8_t)
+
+##### site 9 #####
+site9_p <- site_predict_en(site9_tr, site9_t, c('ln_meter', 'square_feet',
+                                                'air_temperature', 'cloud_coverage',
+                                                'dew_temperature', 'precip_depth_1_hr',
+                                                'sea_level_pressure','wind_direction', 'wind_speed'),
+                           c('square_feet', 'air_temperature',
+                             'cloud_coverage', 'dew_temperature',
+                             'precip_depth_1_hr', 'sea_level_pressure',
+                             'wind_direction', 'wind_speed'))
+
+rm(site9_tr)
+rm(site9_t)
+
+
+##### site 11 #####
+site11_p <- site_predict_en(site11_tr, site11_t, c('ln_meter', 'square_feet',
+                                                   'air_temperature', 'dew_temperature',
+                                                   'precip_depth_1_hr', 'sea_level_pressure',
+                                                   'wind_direction', 'wind_speed'),
+                            c('square_feet', 'air_temperature',
+                              'dew_temperature','precip_depth_1_hr',
+                              'sea_level_pressure', 'wind_direction', 'wind_speed'))
+
+rm(site11_tr)
+rm(site11_t)
+
+##### site 12 #####
+site12_p <- site_predict_en(site12_tr, site12_t, c('ln_meter', 'square_feet',
+                                                   'air_temperature', 'cloud_coverage',
+                                                   'dew_temperature', 'sea_level_pressure',
+                                                   'wind_direction', 'wind_speed'),
+                            c('square_feet', 'air_temperature',
+                              'cloud_coverage', 'dew_temperature',
+                              'sea_level_pressure', 'wind_direction', 'wind_speed'))
+
+rm(site12_tr)
+rm(site12_t)
+
+
+##### site 14 #####
+site14_p <- site_predict_en(site14_tr, site14_t, c('ln_meter', 'square_feet', 'air_temperature',
+                                                   'cloud_coverage', 'dew_temperature', 
+                                                   'precip_depth_1_hr', 'sea_level_pressure',
+                                                   'wind_direction', 'wind_speed'),
+                            c('square_feet', 'air_temperature', 'cloud_coverage',
+                              'dew_temperature', 'precip_depth_1_hr',
+                              'sea_level_pressure','wind_direction', 'wind_speed'))
+
+rm(site14_tr)
+rm(site14_t)
+
+##### site 15 #####
+site15_p <- site_predict_en(site15_tr, site15_t, c('ln_meter', 'square_feet',
+                                                   'air_temperature', 'cloud_coverage',
+                                                   'dew_temperature', 'precip_depth_1_hr',
+                                                   'sea_level_pressure','wind_direction', 'wind_speed'),
+                            c('square_feet', 'air_temperature', 'cloud_coverage',
+                              'dew_temperature', 'precip_depth_1_hr', 'sea_level_pressure',
+                              'wind_direction', 'wind_speed'))
+
+rm(site15_tr)
+rm(site15_t)
+```
+
+```{r lasso predictions, eval=FALSE}
+options(scipen=999)
+## predict with lasso regression
+site_predict_l <- function(df_tr, df_t, terms_tr, terms_t){
+  site_df <- df_tr[, terms_tr] ## training data
+
+  site_df2 <- df_t[, terms_t] ## test data
+  
+  X_tr = model.matrix(ln_meter ~., site_df)[,-1]
+  Y_tr = site_df$ln_meter
+  
+  X_t <- as.matrix(site_df2) ## data for test and predict
+  
+  ## Lasso Regression
+  cv_out <- cv.glmnet(X_tr, Y_tr, alpha = 1)
+  
+  laml <- cv_out$lambda.min
+  
+  print(laml)
+  
+  lasso_fit <- glmnet(X_tr, Y_tr, alpha = 1, lambda = laml)
+  
+  print(coef(lasso_fit))
+  
+  preds <- predict(lasso_fit, X_t)
+
+  df_t$ln_meter <- as.data.frame(preds)
+
+  df_t
+}
+
+
+
+##### site 5 #####
+
+site5_p <- site_predict_l(site5_tr, site5_t,
+                          c('ln_meter', 'square_feet', 'air_temperature',
+                            'floor_count', 'cloud_coverage', 'dew_temperature',
+                            'wind_direction', 'wind_speed'),
+                          c('square_feet', 'air_temperature',
+                            'floor_count', 'cloud_coverage', 
+                            'dew_temperature', 'wind_direction', 'wind_speed'))
+
+rm(site5_tr)
+rm(site5_t)
+
+#### site 7 ####
+site7_p <- site_predict_l(site7_tr, site7_t, c('ln_meter', 'square_feet',
+                                               'floor_count', 'air_temperature',
+                                               'dew_temperature','precip_depth_1_hr',
+                                               'sea_level_pressure', 'wind_direction', 'wind_speed'),
+                          c('square_feet', 'floor_count', 'air_temperature',
+                            'dew_temperature','precip_depth_1_hr', 'sea_level_pressure',
+                            'wind_direction', 'wind_speed'))
+
+rm(site7_tr)
+rm(site7_t)
+
+##### site 13 #####
+site13_p <- site_predict_l(site13_tr, site13_t, 
+                           c('ln_meter', 'square_feet', 'air_temperature',
+                             'cloud_coverage', 'dew_temperature', 'precip_depth_1_hr',
+                             'sea_level_pressure','wind_direction', 'wind_speed'),
+                           c('square_feet', 'air_temperature', 'cloud_coverage',
+                             'dew_temperature', 'precip_depth_1_hr', 'sea_level_pressure',
+                             'wind_direction', 'wind_speed'))
+
+rm(site13_tr)
+rm(site13_t)
+
+```
+
+```{r ridge predictions, eval=FALSE}
+options(scipen=999)
+## predict with ridge regression
+site_predict_r <- function(df_tr, df_t, terms_tr, terms_t){
+  site_df <- df_tr[, terms_tr] ## training data
+
+  site_df2 <- df_t[, terms_t] ## test data
+  
+  X_tr = model.matrix(ln_meter ~., site_df)[,-1]
+  Y_tr = site_df$ln_meter
+  
+  X_t <- as.matrix(site_df2) ## data for test and predict
+  
+  ## Lasso Regression
+  cv_out <- cv.glmnet(X_tr, Y_tr, alpha = 0)
+  
+  lamr <- cv_out$lambda.min
+  
+  print(lamr)
+  
+  ridge_fit <- glmnet(X_tr, Y_tr, alpha = 0, lambda = lamr)
+  
+  print(coef(ridge_fit)) 
+  
+  preds <- predict(ridge_fit, X_t)
+
+  df_t$ln_meter <- as.data.frame(preds)
+
+  df_t
+}
+
+
+##### site 10 #####
+
+site10_p <- site_predict_r(site10_tr, site10_t,
+                            c('ln_meter', 'square_feet',
+                              'floor_count', 'air_temperature', 'cloud_coverage', 
+                              'dew_temperature', 'precip_depth_1_hr',
+                              'sea_level_pressure', 'wind_direction', 'wind_speed'),
+                            c('square_feet', 'floor_count', 'air_temperature',
+                              'cloud_coverage', 'dew_temperature', 'precip_depth_1_hr',
+                              'sea_level_pressure', 'wind_direction', 'wind_speed'))
+
+rm(site10_tr)
+rm(site10_t)
+
+```
+
+
+```{r combined, eval= FALSE}
+## bind prediction datasets together
+
+energy_preds <- rbind(site0_p, site1_p, site2_p, site3_p,
+                      site4_p, site5_p, site6_p, site7_p,
+                      site8_p, site9_p, site10_p, site11_p,
+                      site12_p, site13_p, site14_p, site15_p)
+
+energy_preds$ln_meter <- unlist(energy_preds$ln_meter)
+
+
+
+energy_preds$meter_reading <- exp(energy_preds$ln_meter) - 1
+
+energy_preds$meter_reading <- round(energy_preds$meter_reading, 4)
+
+energy_preds2 <- energy_preds %>% dplyr::select(row_id, meter_reading)
+
+
+
+colnames(energy_preds2) <- c('row_id', 'meter_reading')
+
+fwrite(energy_preds2, '~/Documents/STAT 488/energy_submission3.csv', row.names = FALSE)
+
+
+```
+
