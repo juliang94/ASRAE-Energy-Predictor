@@ -1,2 +1,2 @@
 # ASRAE-Energy-Predictor
-Final Project for Predictive Anlytics (STAT 488)
+Final Project for Predictive Analytics (STAT 488)
